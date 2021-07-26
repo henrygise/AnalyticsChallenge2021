@@ -1,0 +1,618 @@
+---
+title: "SIS Contest"
+author: "Henry Gise"
+date: "7/25/2021"
+output:
+  html_document: default
+---
+
+
+```{r import all necessary files (and create some)}
+require(readr)
+require(tidyverse)
+require(nflfastR)
+# make sure directory is set correctly
+setwd("/Users/gise31/Desktop/Jobs/Sports Analytics/SIS Contest")
+
+GameInfo <- read.csv("GameInfo.csv")
+  GameInfo$GameId <- as.factor(GameInfo$GameId)
+  
+PlayByPlay <- read.csv("PlayByPlay.csv")
+PlayByPlay <- PlayByPlay %>% filter(EPA != "NULL")
+PlayByPlay$GameID <- as.factor(PlayByPlay$GameID)
+PlayByPlay$EventID <- as.factor(PlayByPlay$EventID)
+PlayByPlay$Season <- as.factor(PlayByPlay$Season)
+PlayByPlay$EPA <- as.numeric(PlayByPlay$EPA)
+
+PlayerTotalPoints <- read.csv("PlayerTotalPoints.csv")
+SkillPositionPlayers <- read.csv("SkillPositionPlayers.csv")
+
+gameday_week <- distinct(fast_scraper_schedules(2020)[,c(5,4)])
+
+teams2020 <- read.csv("nfl_teams.csv") %>%
+  mutate(nickname = ifelse(Abbreviation == "WAS","Football Team",word(Name,-1)))
+team_abbrv <- teams2020 %>%
+  select(Abbreviation,nickname) %>%
+  mutate(Abbreviation = 
+           ifelse(Abbreviation == "LAR",
+                  "LA",Abbreviation))
+# manually created
+
+roster2020 <- fast_scraper_roster(2020)
+# use teams set to mutate roster
+roster2020 <- roster2020 %>%
+  left_join(teams2020[,c(3,6)], by = c("team" = "Abbreviation"))
+# reassemble roster
+roster2020 <- roster2020[,c(7,25,3,20)]
+roster2020 <- roster2020 %>%
+  rename(Name = full_name,
+         Team = nickname)
+pbp_2020 <- load_pbp(2020)
+#using nflfastR package
+
+DVOA <- read.csv("DVOA_2020.csv") %>%
+  left_join(team_abbrv, by = c("Team" = "Abbreviation")) %>%
+  mutate(nickname = ifelse(is.na(nickname),"LA",nickname))
+# DVOA can be downloaded from FootballOutsiders at the following link:
+# https://www.footballoutsiders.com/dvoa-ratings/2021/final-2020-dvoa-ratings
+
+ELO <- read.csv("nfl_elo_latest.csv") %>%
+  filter(playoff == "")
+# ELO can be downloaded from the fivethirtyeight github at the following link:
+# https://github.com/fivethirtyeight/data/tree/master/nfl-elo
+
+RTG <- read.csv("OffRTG.csv")[,c(1:4,7)]
+# RTG can be downloaded from Lineups.com at the following link:
+# https://www.lineups.com/nfl/nfl-targets
+```
+
+```{r clean and update PlayerTotalPoints}
+require(readr)
+require(tidyverse)
+setwd("/Users/gise31/Desktop/Jobs/Sports Analytics/SIS Contest")
+
+PlayerTotalPoints <- PlayerTotalPoints %>%
+  filter(TotalPoints != 0 & TotalPoints != "NULL") # take out NULL values
+PlayerTotalPoints$TotalPoints <- as.numeric(PlayerTotalPoints$TotalPoints) # update classes
+PlayerTotalPoints$GameID <- as.factor(PlayerTotalPoints$GameID)
+PlayerTotalPoints$PlayerId <- as.factor(PlayerTotalPoints$PlayerId)
+
+teams2020 <- teams2020 %>%
+  mutate(nickname = ifelse(Abbreviation == "WAS","Football Team",word(Name,-1))) # create team nickname column
+
+# unique SIS player name dataset (helps to find double names)
+SIS_names <- as.data.frame(unique(PlayerTotalPoints[,c(2:3)]))
+colnames(SIS_names)[2] <- "SIS_Name"
+duplicate_SIS_names <- SIS_names[duplicated(SIS_names$SIS_Name),]
+unique_SIS_names <- SIS_names[-duplicated(SIS_names$SIS_Name),]
+
+# create the same thing for roster2020
+roster_names <- as.data.frame(roster2020$Name)
+colnames(roster_names)[1] <- "roster_name"
+duplicate_roster_names <- as.data.frame(roster_names[duplicated(roster_names$roster_name),])
+unique_roster_names <- roster2020[!(duplicated(roster_names) | duplicated(roster_names, fromLast = TRUE)), ]
+
+# export --> names were manually updated in excel to fix misspellings (mostly names with periods like A.J., and Jr.)
+#fwrite(SIS_names,"check_names.csv")
+updated_names <- read.csv("check_names.csv")
+
+# update SIS_names
+SIS_names <- SIS_names %>%
+  left_join(updated_names[,c(1,3)], by = c("SIS_Name" = "Name"))
+SIS_names <- SIS_names[,c(1,3)]
+# join with unique roster names first
+SIS_names <- SIS_names %>%
+  left_join(unique_roster_names, by = c("NewName" = "Name"))
+
+# separate SIS names to eventually recombine
+NA_SIS_names <- SIS_names %>% filter(is.na(Team) & is.na(position)) #iwith NA in team
+filled_SIS_names <- SIS_names %>% filter(!is.na(Team) | !is.na(position)) #no NA in team
+# write NA_SIS_names to excel
+#fwrite(NA_SIS_names,"NA_SIS_names.csv") #manually fix again in excel
+fixed_NA_SIS_names <- read.csv("NA_SIS_names.csv")
+# create a new SIS_names table
+SIS_names <- rbind(filled_SIS_names,fixed_NA_SIS_names) %>% arrange(PlayerId)
+# for some reason, rams players all say NA under team
+SIS_names <- SIS_names %>% mutate(Team = ifelse(is.na(Team),"Rams",Team))
+
+# FINALLY, fix names in PlayerTotalPoints
+  SIS_names$PlayerId <- as.factor(SIS_names$PlayerId)
+PlayerTotalPoints <- PlayerTotalPoints %>% left_join(SIS_names)
+PlayerTotalPoints <- PlayerTotalPoints[,c(1:2,5:7,4,8)]
+colnames(PlayerTotalPoints)[3] <- "Name"
+
+# add GameInfo columns to PlayerTotalPoints (backup saved in emgncy)
+PlayerTotalPoints <- PlayerTotalPoints %>%
+  left_join(GameInfo, by = c("GameID" = "GameId")) %>%
+  mutate(OpponentTeam = ifelse(Team == HomeTeam,AwayTeam,
+                               ifelse(Team == AwayTeam,HomeTeam,"AA_ERROR")))
+
+# export dataset to excel to clean weird teams (players change teams)
+# there are 372 instances where a player is listed as playing on the wrong team
+fix_team_problem <- PlayerTotalPoints %>%
+  filter(OpponentTeam == "AA_ERROR") %>%
+  select(GameID,PlayerId,Name,Team,OpponentTeam,HomeTeam,AwayTeam,Week)
+#fwrite(fix_team_problem,"fixteamproblem.csv")
+# ONCE UPDATED IN EXCEL...
+fix_team_problemFIXED <- read.csv("fixteamproblem.csv")
+#add this into PlayerTotalPoints
+fixed_team_problemOTHERS <- PlayerTotalPoints %>%
+  filter(OpponentTeam != "AA_ERROR") %>%
+  select(GameID,PlayerId,Name,Team,OpponentTeam,HomeTeam,AwayTeam,Week)
+fix_team_problemFIXED <- rbind(fix_team_problemFIXED,fixed_team_problemOTHERS)
+fix_team_problemFIXED$GameID <- as.factor(fix_team_problemFIXED$GameID)
+fix_team_problemFIXED$PlayerId <- as.factor(fix_team_problemFIXED$PlayerId)
+PlayerTotalPoints <- (PlayerTotalPoints[,c(1:2,5:27)] %>%
+  left_join(fix_team_problemFIXED[,c(1:5)], by = c("GameID","PlayerId")))
+PlayerTotalPoints <- PlayerTotalPoints[,c(1:3,26:28,4:25)]
+
+# add position groups to PlayerTotalPoints
+PlayerTotalPoints <- PlayerTotalPoints %>%
+  mutate(PositionGroup = ifelse(
+    position == "C" | position == "G" | position == "OL" | position == "T","OL",ifelse(
+      position == "CB" | position == "DB" | position == "DE" | position == "DT" | position == "FS"
+      | position == "LB" | position == "NT" | position == "S" | position == "SS","Defense",ifelse(
+        position == "RB" | position == "FB","RB",ifelse(
+          position == "WR" | position == "TE","Receiver",ifelse(
+            position == "QB","QB","Special"))))))
+#updates for Kendall Hinton
+PlayerTotalPoints[9550,29] <- "QB"
+PlayerTotalPoints[9550,3] <- "QB"
+
+#update PlayerTotalPoints to include hometeam and awayteam markings
+PlayerTotalPoints <- PlayerTotalPoints %>%
+  mutate(homeORaway = ifelse(Team == HomeTeam,"Home","Away"))
+PlayerTotalPoints <- PlayerTotalPoints %>%
+  mutate(home = ifelse(homeORaway == "Home",1,0),
+         away = ifelse(homeORaway == "Away",1,0))
+```
+
+```{r get QB ELOs and other stuff}
+ELO_qbs <- ELO[,c(1:30)] %>%
+  mutate(team1 = ifelse(team1 == "WSH","WAS",
+                        ifelse(team1 == "LAR","LA",
+                               ifelse(team1 == "OAK","LV",team1))),
+         team2 = ifelse(team2 == "WSH","WAS",
+                        ifelse(team2 == "LAR","LA",
+                               ifelse(team2 == "OAK","LV",team2))))
+  
+qb1_elo <- ELO_qbs %>%
+  select(date,team1,qb1,qb1_value_post) %>%
+  rename(team = team1, qb = qb1, qb_value = qb1_value_post)
+qb2_elo <- ELO_qbs %>%
+  select(date,team2,qb2,qb2_value_post) %>%
+  rename(team = team2, qb = qb2, qb_value = qb2_value_post)
+qb_elo <- distinct(bind_rows(qb1_elo,qb2_elo) %>%
+  left_join(team_abbrv, by = c("team" = "Abbreviation"))) %>%
+  left_join(gameday_week, c("date" = "gameday")) %>%
+  group_by(qb) %>%
+  arrange(desc(date)) %>%
+  mutate(final_qb_value = qb_value[1],
+         max_qb_value = max(qb_value))
+
+# defensive EPA for each team
+defense_epa <- PlayByPlay %>%
+  group_by(DefensiveTeam) %>% summarise(EPA = mean(EPA, na.rm = TRUE))
+
+# total points for each position group (grop?) per team per week 
+ppw_pos_grop <- PlayerTotalPoints %>%
+  group_by(Week,Team,OpponentTeam,PositionGroup) %>%
+  summarise(TotalPoints = sum(TotalPoints)) %>%
+  pivot_wider(names_from = PositionGroup, values_from = TotalPoints)
+```
+
+```{r compile WR data}
+# target share figures for all pass-catchers (99.9% WR,TE,RB)
+getTargetShare <- pbp_2020 %>%
+  filter(!is.na(receiver), week <= 17) %>%
+  group_by(posteam,week) %>%
+  mutate(total_targets = n()) %>%
+  ungroup() %>%
+  group_by(posteam,week,receiver,receiver_id,total_targets) %>%
+  summarise(ind_targets = n()) %>%
+  mutate(target_share = ind_targets/total_targets) %>%
+  group_by(receiver,receiver_id) %>%
+  mutate(avg_target_share = mean(target_share)) %>%
+  left_join(RTG, by = c("posteam" = "TEAM","receiver" = "NAME")) %>%
+  left_join(team_abbrv, by = c("posteam" = "Abbreviation"))
+noNA <- filter(getTargetShare,!is.na(RTG))
+yesNA <- filter(getTargetShare,is.na(RTG)) %>%
+  select(-Name,-POS,-RTG) %>%
+  left_join(RTG[,c(1:3,5)], by = c("receiver" = "NAME"))
+getTargetShare <- rbind(noNA,yesNA) %>% filter(!is.na(RTG))
+
+# Lineups Ratings for all pass-catchers for all teams
+ReceiverDepth_RTG_ALL <- distinct(getTargetShare %>%
+  group_by(nickname,Name) %>% 
+  summarise(RTG,avg_target_share,
+            avg_value = RTG*avg_target_share)) %>%
+  group_by(nickname) %>%
+  arrange(-avg_value) %>%
+  mutate(depth = row_number()) %>%
+  pivot_wider(id_cols = nickname, names_from = depth, values_from = RTG)
+
+# Names of all pass-catchers for all teams
+ReceiverDepth_names <- distinct(getTargetShare %>%
+  group_by(nickname,Name) %>% 
+    summarise(RTG,avg_target_share,
+              avg_value = RTG*avg_target_share)) %>%
+  group_by(nickname) %>%
+  arrange(-avg_value) %>%
+  mutate(depth = row_number()) %>%
+  pivot_wider(id_cols = nickname, names_from = depth, values_from = Name)
+
+# Positions of all pass-catchers for all teams
+ReceiverDepth_POS <- distinct(getTargetShare %>%
+  group_by(nickname,Name,POS) %>% 
+    summarise(RTG,avg_target_share,POS,
+              avg_value = RTG*avg_target_share)) %>%
+  group_by(nickname) %>%
+  arrange(-avg_value) %>%
+  mutate(depth = row_number()) %>%
+  pivot_wider(id_cols = nickname, names_from = depth, values_from = POS)
+
+ReceiverDepth_tgt_share <- distinct(getTargetShare %>%
+  group_by(nickname,Name) %>% 
+  summarise(RTG,avg_target_share,
+                avg_value = RTG*avg_target_share)) %>%
+  group_by(nickname) %>%
+  arrange(-avg_value) %>%
+  mutate(depth = row_number()) %>%
+  pivot_wider(id_cols = nickname, names_from = depth, values_from = avg_target_share)
+
+weeklyReceiverDepth_value_ALL <- getTargetShare %>%
+  group_by(nickname,Name,week) %>%
+  summarise(RTG,target_share,
+            weekly_value = RTG*target_share) %>%
+  group_by(nickname,week) %>%
+  arrange(-weekly_value) %>%
+  mutate(weekly_depth = row_number()) %>%
+  pivot_wider(id_cols = c(nickname,week),names_from = c(weekly_depth), values_from = weekly_value)
+
+ReceiverDepth_lookup <- distinct(getTargetShare %>%
+  group_by(nickname,Name,POS) %>% 
+  summarise(RTG,avg_target_share,
+  avg_value = RTG*avg_target_share)) %>%
+  group_by(nickname,POS) %>%
+  arrange(-avg_value) %>%
+  mutate(depth = row_number())
+
+# mean values for calculating averages
+mean.RTG.1 <- mean(ReceiverDepth_RTG_ALL$`1`)
+mean.RTG.2 <- mean(ReceiverDepth_RTG_ALL$`2`)
+mean.RTG.3 <- mean(ReceiverDepth_RTG_ALL$`3`)
+mean.RTG.4 <- mean(ReceiverDepth_RTG_ALL$`4`)
+
+mean.tgt.1 <- mean(ReceiverDepth_tgt_share$`1`)
+mean.tgt.2 <- mean(ReceiverDepth_tgt_share$`2`)
+mean.tgt.3 <- mean(ReceiverDepth_tgt_share$`3`)
+mean.tgt.4 <- mean(ReceiverDepth_tgt_share$`4`)
+```
+
+```{r create wrGames dataset over which to regress}
+wrGames <- GameInfo %>%
+  select(-HomeTeamId,-AwayTeamId) %>%
+  mutate(SvHomeTeam = HomeTeam,SvAwayTeam = AwayTeam) %>%
+  pivot_longer(cols = c(HomeTeam,AwayTeam),names_to = "Location", values_to = "Team") %>%
+  mutate(Location = ifelse(Location == "HomeTeam","H","A"),
+         Opponent = ifelse(Team == SvHomeTeam, SvAwayTeam,SvHomeTeam)) %>%
+  mutate(SpreadResult = ifelse(Location == "A",-SpreadResult,SpreadResult)) %>%
+  mutate(Location = ifelse((Team == "49ers" & Opponent == "Cardinals") | 
+                             (Team == "Cardinals" & Opponent == "49ers"), "N",Location)) %>%
+  select(Week,Team,Opponent,Location,SpreadResult,SpreadLine) %>%
+  left_join(weeklyReceiverDepth_value_ALL, by = c("Team" = "nickname","Week" = "week")) %>%
+  left_join(weeklyReceiverDepth_value_ALL, by = c("Opponent" = "nickname","Week" = "week")) %>%
+  left_join(defense_epa, by = c("Team" = "DefensiveTeam")) %>%
+  left_join(defense_epa, by = c("Opponent" = "DefensiveTeam")) %>%
+  left_join(DVOA, by = c("Team" = "nickname")) %>%
+  left_join(ppw_pos_grop[,-3]) %>%
+  left_join(ppw_pos_grop[,-2], by = c("Week" = "Week","Team" = "OpponentTeam")) %>%
+  left_join(qb_elo[,c(3:6)], by = c("Team" = "nickname", "Week" = "week")) %>%
+  left_join(qb_elo[,c(3:6)], by = c("Opponent" = "nickname", "Week" = "week")) %>%
+  mutate(
+    qb_elo = qb_value.x - qb_value.y,
+    QBspread = QB.x - QB.y,
+    Defense_points = Defense.x - Defense.y,
+    OL_points = OL.x - OL.y,
+    QB_points = QB.x - QB.y,
+    RB_points = RB.x - RB.y,
+    Receiver_points = Receiver.x - Receiver.y,
+    Special_points = Special.x - Special.y,
+    EPA = EPA.x - EPA.y,
+    Offense.x = OL.x + RB.x + Receiver.x,
+    Offense.y = OL.y + RB.y + Receiver.y,
+    Offensespread = OL.x + RB.x + Receiver.x - OL.y + RB.y + Receiver.y,
+    Top3Receivers.x = `1.x` + `2.x` + `3.x`,
+    Top3Receivers.y = `1.y` + `2.y` + `3.y`,
+    Top3Receivers = Top3Receivers.x - Top3Receivers.y
+  )
+```
+
+```{r create QB model}
+
+lm.QB <- lm(SpreadResult ~ qb_elo + Defense_points + DefDVOA + OL_points +
+                       Receiver_points + RB_points + Special_points + Top3Receivers, data = wrGames)
+
+QB_coefficient <- lm.QB$coefficients[2]
+
+lower_conf <- confint(lm.QB)[2,1]
+upper_conf <- confint(lm.QB)[2,2]
+```
+
+```{r use the QB model to create the QB database}
+QB_database <- wrGames %>%
+  select(Team,Week,qb.x,qb_value.x) %>%
+  arrange(desc(Week)) %>%
+  rename(name = qb.x, ELO = qb_value.x) %>%
+  group_by(Team,name) %>%
+  summarise(EOS_EOL = ELO[1]) %>%
+  arrange(-EOS_EOL) %>%
+  group_by(Team) %>%
+  mutate(depth = row_number(),
+         max_team_EOL = max(EOS_EOL)) %>%
+  ungroup() %>%
+  mutate(diff_EOL = ifelse(depth == 1 ,0,EOS_EOL - max_team_EOL))
+
+average_QB_EOL_1 <- mean((filter(QB_database,depth == 1))$EOS_EOL)
+average_QB_EOL_2 <- mean((filter(QB_database,depth == 2))$EOS_EOL)
+average_QB_EOL_3 <- mean((filter(QB_database,depth == 3))$EOS_EOL)
+
+average_ELO <- mean(QB_database$EOS_EOL)
+replacement_ELO <- mean((filter(QB_database,depth > 1) %>% head(23))$EOS_EOL)
+```
+
+```{r create QB functions}
+# this function uses the value of the "replacement" quarterback to calculate the value of the "starting" quarterback
+qb_spread_value <- function(qb1, qb2){
+  qb1_value <- QB_database$EOS_EOL[match(qb1,QB_database$name)]
+  qb2_value <- QB_database$EOS_EOL[match(qb2,QB_database$name)]
+  point_spread_difference <- QB_coefficient*(qb1_value - qb2_value)
+  low_end_diff <- lower_conf*(qb1_value - qb2_value)
+  upper_end_diff <- upper_conf*(qb1_value - qb2_value)
+  
+team_1 <- QB_database$Team[match(qb1,QB_database$name)]
+team_2 <- QB_database$Team[match(qb2,QB_database$name)]
+
+paste0("Replacing ",team_1," QB ",qb1," with ",team_2," QB ",qb2," results in a difference of ",round(-point_spread_difference,1)," points. There's a 95% chance that the difference is between ",round(-low_end_diff,1)," and ",round(-upper_end_diff,1))
+}
+qb_spread_value("Patrick Mahomes","Chad Henne")
+
+qb_individual <- function(qb){
+  team <- QB_database$Team[match(qb,QB_database$name)]
+
+  depth_chart <- QB_database %>% filter(Team == team) %>%
+    mutate(spread_value = round(QB_coefficient*(diff_EOL),1)) %>%
+    select(depth,name,spread_value)
+  
+  qb_depth <- depth_chart$depth[match(qb,depth_chart$name)]
+
+  depth <- NROW(depth_chart)
+  
+  qb_value <- QB_database$EOS_EOL[match(qb,QB_database$name)]
+  
+  avg_point_spread_difference <- QB_coefficient*(qb_value - average_QB_EOL_1)
+  rpl_point_spread_difference <- QB_coefficient*(qb_value - replacement_ELO)
+  
+  avg_above <- ifelse(round(avg_point_spread_difference,1) < 0,
+                      "less","more")
+  rpl_above <- ifelse(round(rpl_point_spread_difference,1) < 0,
+                      "less","more")
+  
+  
+  if (qb_depth == 1){
+    if (depth == 1){
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback.")
+    }
+    if (depth == 2){ #only one backup
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[2]," the spread would change by ",depth_chart$spread_value[2] - depth_chart$spread_value[qb_depth])
+    }
+    if (depth == 3){ #backup and third string
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[2]," the spread would change by ",depth_chart$spread_value[2] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[3]," the spread would change by ",depth_chart$spread_value[3] - depth_chart$spread_value[qb_depth],".")
+    }
+    if (depth == 4){ #backup, third string, fourth string
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[2]," the spread would change by ",depth_chart$spread_value[2] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[3]," the spread would change by ",depth_chart$spread_value[3] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[4]," the spread would change by ",depth_chart$spread_value[4] - depth_chart$spread_value[qb_depth],".")
+    }
+  }
+  
+  if (qb_depth == 2){
+    if (depth == 2){ #only one backup
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[1]," the spread would change by ",depth_chart$spread_value[1] - depth_chart$spread_value[qb_depth])
+    }
+    if (depth == 3){ #backup and third string
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[1]," the spread would change by ",depth_chart$spread_value[1] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[3]," the spread would change by ",depth_chart$spread_value[3] - depth_chart$spread_value[qb_depth],".")
+    }
+    if (depth == 4){ #backup, third string, fourth string
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[1]," the spread would change by ",depth_chart$spread_value[1] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[3]," the spread would change by ",depth_chart$spread_value[3] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[4]," the spread would change by ",depth_chart$spread_value[4] - depth_chart$spread_value[qb_depth],".")
+    }
+  }
+  
+  if (qb_depth == 3){
+    if (depth == 3){ #backup and third string
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[1]," the spread would change by ",depth_chart$spread_value[1] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[2]," the spread would change by ",depth_chart$spread_value[2] - depth_chart$spread_value[qb_depth],".")
+    }
+    if (depth == 4){ #backup, third string, fourth string
+      return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[1]," the spread would change by ",depth_chart$spread_value[1] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[2]," the spread would change by ",depth_chart$spread_value[2] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[4]," the spread would change by ",depth_chart$spread_value[4] - depth_chart$spread_value[qb_depth],".")
+    }
+  }
+  
+  if (qb_depth == 4){
+    return <- paste0(team," QB ",qb," impacts the point spread by ",round(avg_point_spread_difference,1)," points compared to the average starting quarterback. He impacts the spread by ",round(rpl_point_spread_difference,1)," points ",rpl_above," than the average replacement quarterback. If he were replaced by ",depth_chart$name[1]," the spread would change by ",depth_chart$spread_value[1] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[2]," the spread would change by ",depth_chart$spread_value[2] - depth_chart$spread_value[qb_depth],". If he were replaced by ",depth_chart$name[3]," the spread would change by ",depth_chart$spread_value[3] - depth_chart$spread_value[qb_depth],".")
+  }
+  
+  return
+  }
+qb_individual("Patrick Mahomes")
+qb_individual("Drew Brees")
+qb_individual("Drew Lock")
+```
+
+```{r create WR model}
+
+lm.WR <- lm(SpreadResult ~  qb_elo + Defense_points + EPA + Top3Receivers +
+              RB_points + Special_points, data = wrGames)
+
+WR_coefficient = lm.WR$coefficients[5]
+lower_WRconf <- confint(lm.WR)[4,1]
+upper_WRconf <- confint(lm.WR)[4,2]
+```
+
+```{r create WR functions}
+### WR FUNCTION ###
+wr_function <- function(team, receiver_depth){
+  
+  # receiver 1
+  receiver.1 <- ReceiverDepth_names$`1`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.1 <- ReceiverDepth_tgt_share$`1`[match(team,ReceiverDepth_names$nickname)]
+  POS.1 <- ReceiverDepth_POS$`1`[match(team,ReceiverDepth_names$nickname)]
+  RTG.1 <- ReceiverDepth_RTG_ALL$`1`[match(team,ReceiverDepth_names$nickname)]
+  
+  # receiver 2
+  receiver.2 <- ReceiverDepth_names$`2`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.2 <- ReceiverDepth_tgt_share$`2`[match(team,ReceiverDepth_names$nickname)]
+  RTG.2 <- ReceiverDepth_RTG_ALL$`2`[match(team,ReceiverDepth_names$nickname)]
+  POS.2 <- ReceiverDepth_POS$`2`[match(team,ReceiverDepth_names$nickname)]
+  
+  # receiver 3
+  receiver.3 <- ReceiverDepth_names$`3`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.3 <- ReceiverDepth_tgt_share$`3`[match(team,ReceiverDepth_names$nickname)]
+  RTG.3 <- ReceiverDepth_RTG_ALL$`3`[match(team,ReceiverDepth_names$nickname)]
+  POS.3 <- ReceiverDepth_POS$`3`[match(team,ReceiverDepth_names$nickname)]
+  
+  # receiver 4
+  receiver.4 <- ReceiverDepth_names$`4`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.4 <- ReceiverDepth_tgt_share$`4`[match(team,ReceiverDepth_names$nickname)]
+  RTG.4 <- ReceiverDepth_RTG_ALL$`4`[match(team,ReceiverDepth_names$nickname)]
+  POS.4 <- ReceiverDepth_POS$`4`[match(team,ReceiverDepth_names$nickname)]
+  
+  avg_tgt_share.1 <- ifelse(POS.2 == "RB" & receiver_depth == 1,avg_tgt_share.2,avg_tgt_share.1)
+  avg_tgt_share.2 <- ifelse(POS.2 == "RB" & receiver_depth == 1,avg_tgt_share.1,avg_tgt_share.2)
+  
+  avg_tgt_share.2 <- ifelse(POS.3 == "RB" & receiver_depth <= 2,avg_tgt_share.3,avg_tgt_share.2)
+  avg_tgt_share.3 <- ifelse(POS.3 == "RB" & receiver_depth <= 2,avg_tgt_share.2,avg_tgt_share.3)
+  
+  avg_tgt_share.3 <- ifelse(POS.4 == "RB" & receiver_depth <= 3,avg_tgt_share.4,avg_tgt_share.3)
+  avg_tgt_share.4 <- ifelse(POS.4 == "RB" & receiver_depth <= 3,avg_tgt_share.3,avg_tgt_share.4)
+  
+  old_spread_value <- RTG.1*avg_tgt_share.1 + RTG.2*avg_tgt_share.2 + RTG.3*avg_tgt_share.3
+  
+
+  if (receiver_depth == 1){
+    new_spread_value <- min(RTG.2,RTG.1)*avg_tgt_share.1 + min(RTG.2,RTG.3)*avg_tgt_share.2 + min(RTG.3,RTG.4)*avg_tgt_share.3
+    receiver_name <- receiver.1
+    POS <- POS.1
+  }
+  if (receiver_depth == 2){
+    new_spread_value <- RTG.1*avg_tgt_share.1 + min(RTG.2,RTG.3)*avg_tgt_share.2 + min(RTG.3,RTG.4)*avg_tgt_share.3
+    receiver_name <- receiver.2
+    POS <- POS.2
+  }
+  if (receiver_depth == 3){
+    new_spread_value <- RTG.1*avg_tgt_share.1 + RTG.2*avg_tgt_share.2 + min(RTG.3,RTG.4)*avg_tgt_share.3
+    receiver_name <- receiver.3
+    POS <- POS.3
+  }
+  if (receiver_depth == 4){
+    new_spread_value <- old_spread_value
+    receiver_name <- receiver.4
+    POS <- POS.4
+  }
+  if (receiver_depth > 4){
+    new_spread_value <- old_spread_value
+    receiver_name <- paste("any pass-catcher besides",receiver.1,",",receiver.2,",",receiver.3,", or",receiver.4,sep = " ")
+  }
+  spread_difference = (new_spread_value - old_spread_value)*WR_coefficient
+  
+  ifelse(
+    POS != "WR",
+     paste("WARNING: This player is not a wide receiver...Losing",team,POS,receiver_name,"will result in a point spread difference of",round(spread_difference,1),"points.",sep=" "),
+     paste("Losing",team,POS,receiver_name,"will result in a point spread difference of",round(spread_difference,1),"points.",sep=" ")
+  )
+}
+
+wr_function("Eagles",1)
+
+wr_spread_value <- function(team,receiver_name){
+  
+  receiver_depth <- (ReceiverDepth_lookup %>% filter(nickname == team))$depth[match(receiver_name,(ReceiverDepth_lookup %>% filter(nickname == team))$Name)]
+  receiver_RTG <- (ReceiverDepth_lookup %>% filter(nickname == team))$RTG[match(receiver_name,(ReceiverDepth_lookup %>% filter(nickname == team))$Name)]
+  POS <- (ReceiverDepth_lookup %>% filter(nickname == team))$POS[match(receiver_name,(ReceiverDepth_lookup %>% filter(nickname == team))$Name)]
+  tgt <- (ReceiverDepth_lookup %>% filter(nickname == team))$avg_target_share[match(receiver_name,(ReceiverDepth_lookup %>% filter(nickname == team))$Name)]
+  
+  # receiver 1
+  receiver.1 <- ReceiverDepth_names$`1`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.1 <- ReceiverDepth_tgt_share$`1`[match(team,ReceiverDepth_names$nickname)]
+  RTG.1 <- ReceiverDepth_RTG_ALL$`1`[match(team,ReceiverDepth_names$nickname)]
+  POS.1 <- ReceiverDepth_POS$`1`[match(team,ReceiverDepth_names$nickname)]
+  
+  # receiver 2
+  receiver.2 <- ReceiverDepth_names$`2`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.2 <- ReceiverDepth_tgt_share$`2`[match(team,ReceiverDepth_names$nickname)]
+  RTG.2 <- ReceiverDepth_RTG_ALL$`2`[match(team,ReceiverDepth_names$nickname)]
+  POS.2 <- ReceiverDepth_POS$`2`[match(team,ReceiverDepth_names$nickname)]
+  
+  # receiver 3
+  receiver.3 <- ReceiverDepth_names$`3`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.3 <- ReceiverDepth_tgt_share$`3`[match(team,ReceiverDepth_names$nickname)]
+  RTG.3 <- ReceiverDepth_RTG_ALL$`3`[match(team,ReceiverDepth_names$nickname)]
+  POS.3 <- ReceiverDepth_POS$`3`[match(team,ReceiverDepth_names$nickname)]
+  
+  # receiver 4
+  receiver.4 <- ReceiverDepth_names$`4`[match(team,ReceiverDepth_names$nickname)]
+  avg_tgt_share.4 <- ReceiverDepth_tgt_share$`4`[match(team,ReceiverDepth_names$nickname)]
+  RTG.4 <- ReceiverDepth_RTG_ALL$`4`[match(team,ReceiverDepth_names$nickname)]
+  POS.4 <- ReceiverDepth_POS$`4`[match(team,ReceiverDepth_names$nickname)]
+  
+  avg_tgt_share.1 <- ifelse(POS.2 == "RB" & receiver_depth == 1,avg_tgt_share.2,avg_tgt_share.1)
+  avg_tgt_share.2 <- ifelse(POS.2 == "RB" & receiver_depth == 1,avg_tgt_share.1,avg_tgt_share.2)
+  
+  avg_tgt_share.2 <- ifelse(POS.3 == "RB" & receiver_depth <= 2,avg_tgt_share.3,avg_tgt_share.2)
+  avg_tgt_share.3 <- ifelse(POS.3 == "RB" & receiver_depth <= 2,avg_tgt_share.2,avg_tgt_share.3)
+  
+  avg_tgt_share.3 <- ifelse(POS.4 == "RB" & receiver_depth <= 3,avg_tgt_share.4,avg_tgt_share.3)
+  avg_tgt_share.4 <- ifelse(POS.4 == "RB" & receiver_depth <= 3,avg_tgt_share.3,avg_tgt_share.4)
+  
+  old_spread_value <- RTG.1*avg_tgt_share.1 + RTG.2*avg_tgt_share.2 + RTG.3*avg_tgt_share.3
+  
+  
+  if (receiver_depth == 1){
+    new_spread_value <- min(RTG.2,RTG.1)*avg_tgt_share.1 + min(RTG.2,RTG.3)*avg_tgt_share.2 + min(RTG.3,RTG.4)*avg_tgt_share.3
+    receiver_name <- receiver.1
+    RTG_tgt_share_diff <- (tgt*(receiver_RTG - mean.RTG.2) + mean.tgt.2*(mean.RTG.2 - mean.RTG.3) + mean.tgt.3*(mean.RTG.3 - mean.RTG.4))
+  }
+  if (receiver_depth == 2){
+    new_spread_value <- RTG.1*avg_tgt_share.1 + min(RTG.2,RTG.3)*avg_tgt_share.2 + min(RTG.3,RTG.4)*avg_tgt_share.3
+    receiver_name <- receiver.2
+    RTG_tgt_share_diff <- (mean.tgt.1*(mean.RTG.1 - mean.RTG.1) + tgt*(receiver_RTG - mean.RTG.3) + mean.tgt.3*(mean.RTG.3 - mean.RTG.4))
+  }
+  if (receiver_depth == 3){
+    new_spread_value <- RTG.1*avg_tgt_share.1 + RTG.2*avg_tgt_share.2 + min(RTG.3,RTG.4)*avg_tgt_share.3
+    receiver_name <- receiver.3
+    RTG_tgt_share_diff <- (mean.tgt.1*(mean.RTG.1 - mean.RTG.1) + mean.tgt.2*(RTG - mean.RTG.3) + tgt*(receiver_RTG - mean.RTG.4))
+  }
+  if (receiver_depth == 4){
+    new_spread_value <- old_spread_value
+    receiver_name <- receiver.4
+    RTG_tgt_share_diff <- 0
+  }
+  if (receiver_depth > 4){
+    new_spread_value <- old_spread_value
+    receiver_name <- paste0(" any pass-catcher besides ",receiver.1,", ",receiver.2,",",receiver.3,", or ",receiver.4)
+    RTG_tgt_share_diff <- 0
+  }
+  spread_value_team <- (old_spread_value - new_spread_value)*WR_coefficient
+  
+  #RTG_tgt_share_diff <- ifelse(receiver_RTG > mean.RTG.1, (receiver_RTG - mean.RTG.4)*mean.tgt.1,
+  #                           ifelse(receiver_RTG > mean.RTG.2, (receiver_RTG - mean.RTG.4)*mean.tgt.2,
+  #                                  ifelse(receiver_RTG > mean.RTG.3, (receiver_RTG - mean.RTG.4)*mean.tgt.3,
+  #                                         (receiver_RTG - mean.RTG.4)*mean.tgt.4)))
+  
+  
+  spread_value_avg <- RTG_tgt_share_diff*WR_coefficient
+  
+  ifelse(POS == "RB",paste0("Enter the name of a TE or WR."),
+         paste0("To the ",team," ",receiver_name," is worth ",round(spread_value_team,1)," points. On average, he is worth ",round(spread_value_avg,1)," points."))
+}
+
+wr_spread_value("Falcons","Julio Jones")
+wr_spread_value("Vikings","Dalvin Cook")
+```
